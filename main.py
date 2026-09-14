@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
-# 爆款视频 → Brief 分析工具(网页版 · 单文件)
-# 部署在 Replit:粘链接 → Gemini 看视频 → 出填好的 brief
+# 爆款视频 → Brief 分析工具(网页版 · 后台异步版)
+# 部署在 Render:粘链接 → Gemini 看视频 → 出填好的 brief
 #
-# 需要在 Replit 的 Secrets 里加一个:
-#   GEMINI_API_KEY = 你的 key(去 https://aistudio.google.com/apikey 免费领)
+# 在 Render 的 Environment 里需要:GEMINI_API_KEY
 
 import os
 import re
 import json
 import time
+import uuid
 import tempfile
+import threading
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # ============================================================
-# 配置 —— 随时改
+# 配置
 # ============================================================
 DEFAULT_MODEL = "gemini-3-flash-preview"  # 报错就换最新 flash 型号
 
@@ -28,6 +29,9 @@ PRODUCT_CONTEXT = """
 渠道:短视频/长视频 KOL,含巴西/拉美地区(需要时输出可用于葡语改编)。
 """
 # ============================================================
+
+# 内存里存任务状态 {job_id: {stage, done, html, error}}
+JOBS = {}
 
 
 def detect_platform(url):
@@ -77,7 +81,6 @@ def download_video(url):
     import yt_dlp
     tmp_dir = tempfile.mkdtemp(prefix="vbrief_")
     out_tmpl = os.path.join(tmp_dir, "video.%(ext)s")
-    # 单文件 mp4,避免需要 ffmpeg 合并
     opts = {
         "format": "best[ext=mp4]/best",
         "outtmpl": out_tmpl,
@@ -247,6 +250,32 @@ def render_long(data, meta):
 """
 
 
+# ---------------- 后台任务 ----------------
+def run_job(job_id, url, t):
+    try:
+        platform = detect_platform(url)
+        JOBS[job_id]["stage"] = "读取视频信息…"
+        meta = fetch_metadata(url)
+        video_type = t if t in ("short", "long") else guess_type(url, platform, meta)
+
+        video_path = None
+        if platform != "youtube":
+            JOBS[job_id]["stage"] = "下载视频中…(TikTok/IG 可能较慢)"
+            video_path = download_video(url)
+
+        JOBS[job_id]["stage"] = "Gemini 观看并分析中…(通常 30–90 秒)"
+        prompt = build_prompt(video_type, meta)
+        data = call_gemini(prompt, platform, url, video_path)
+
+        JOBS[job_id]["stage"] = "生成 brief…"
+        html = render_short(data, meta) if video_type == "short" else render_long(data, meta)
+        JOBS[job_id]["html"] = html
+        JOBS[job_id]["done"] = True
+    except Exception as e:
+        JOBS[job_id]["error"] = str(e)
+        JOBS[job_id]["done"] = True
+
+
 # ---------------- 网页 ----------------
 PAGE = """<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -262,7 +291,9 @@ input[type=text]{width:100%;padding:12px;font-size:15px;border:1px solid #dfe1e6
 label{font-size:14px;cursor:pointer;}
 button{background:#0052cc;color:#fff;border:none;padding:12px 24px;font-size:15px;border-radius:6px;cursor:pointer;font-weight:600;}
 button:disabled{background:#a5adba;cursor:not-allowed;}
-#status{margin-top:16px;color:#5e6c84;font-size:14px;}
+#status{margin-top:16px;color:#5e6c84;font-size:14px;min-height:20px;}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid #ccd;border-top-color:#0052cc;border-radius:50%;animation:s 1s linear infinite;vertical-align:middle;margin-right:8px;}
+@keyframes s{to{transform:rotate(360deg)}}
 #result{background:#fff;border-radius:10px;padding:24px;margin-top:20px;box-shadow:0 1px 4px rgba(0,0,0,.08);display:none;}
 .err{color:#bf2600;}
 ul{margin-top:4px;}
@@ -270,7 +301,7 @@ ul{margin-top:4px;}
 <div class="card">
 <h1 class="top">爆款视频 → Brief 分析工具</h1>
 <p class="sub">粘一个视频链接(YouTube / TikTok / Instagram / X),自动拆解要点,出可执行 brief。</p>
-<input id="url" type="text" placeholder="https://www.tiktok.com/@fomo/video/...">
+<input id="url" type="text" placeholder="https://www.youtube.com/watch?v=...">
 <div class="row">
 <span style="font-size:14px;">模板:</span>
 <label><input type="radio" name="t" value="auto" checked> 自动判断</label>
@@ -283,20 +314,34 @@ ul{margin-top:4px;}
 <div id="result"></div>
 </div>
 <script>
+let timer=null;
 async function run(){
   const url=document.getElementById('url').value.trim();
   if(!url){alert('先粘个链接');return;}
   const t=document.querySelector('input[name=t]:checked').value;
   const btn=document.getElementById('go'), st=document.getElementById('status'), res=document.getElementById('result');
   btn.disabled=true; res.style.display='none';
-  st.innerHTML='⏳ 分析中,长视频可能要 1-2 分钟,别关页面...';
+  st.innerHTML='<span class="spin"></span>启动中…';
   try{
     const r=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,type:t})});
     const d=await r.json();
-    if(d.error){st.innerHTML='<span class="err">❌ '+d.error+'</span>';}
-    else{st.innerHTML=''; res.innerHTML=d.html; res.style.display='block'; res.scrollIntoView({behavior:'smooth'});}
-  }catch(e){st.innerHTML='<span class="err">❌ 出错了:'+e+'</span>';}
-  btn.disabled=false;
+    if(d.error){st.innerHTML='<span class="err">❌ '+d.error+'</span>';btn.disabled=false;return;}
+    poll(d.job_id);
+  }catch(e){st.innerHTML='<span class="err">❌ 启动失败:'+e+'</span>';btn.disabled=false;}
+}
+function poll(id){
+  if(timer)clearInterval(timer);
+  timer=setInterval(async()=>{
+    try{
+      const r=await fetch('/status/'+id);
+      const d=await r.json();
+      const st=document.getElementById('status'), res=document.getElementById('result'), btn=document.getElementById('go');
+      if(!d.done){st.innerHTML='<span class="spin"></span>'+(d.stage||'处理中…');return;}
+      clearInterval(timer);btn.disabled=false;
+      if(d.error){st.innerHTML='<span class="err">❌ '+d.error+'</span>';}
+      else{st.innerHTML='✅ 完成';res.innerHTML=d.html;res.style.display='block';res.scrollIntoView({behavior:'smooth'});}
+    }catch(e){/* 网络抖动,继续轮询 */}
+  },3000);
 }
 </script></body></html>"""
 
@@ -308,29 +353,25 @@ def index():
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    try:
-        body = request.get_json(force=True)
-        url = (body.get("url") or "").strip()
-        t = body.get("type", "auto")
-        if not url:
-            return jsonify({"error": "没有链接"})
-        if "GEMINI_API_KEY" not in os.environ:
-            return jsonify({"error": "还没设置 GEMINI_API_KEY(在 Replit 的 Secrets 里加)"})
+    body = request.get_json(force=True)
+    url = (body.get("url") or "").strip()
+    t = body.get("type", "auto")
+    if not url:
+        return jsonify({"error": "没有链接"})
+    if "GEMINI_API_KEY" not in os.environ:
+        return jsonify({"error": "还没设置 GEMINI_API_KEY"})
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {"stage": "排队中…", "done": False, "html": None, "error": None}
+    threading.Thread(target=run_job, args=(job_id, url, t), daemon=True).start()
+    return jsonify({"job_id": job_id})
 
-        platform = detect_platform(url)
-        meta = fetch_metadata(url)
-        video_type = t if t in ("short", "long") else guess_type(url, platform, meta)
 
-        video_path = None
-        if platform != "youtube":
-            video_path = download_video(url)
-
-        prompt = build_prompt(video_type, meta)
-        data = call_gemini(prompt, platform, url, video_path)
-        html = render_short(data, meta) if video_type == "short" else render_long(data, meta)
-        return jsonify({"html": html})
-    except Exception as e:
-        return jsonify({"error": str(e)})
+@app.route("/status/<job_id>")
+def status(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"done": True, "error": "任务不存在(可能服务器重启了,重试一次)"})
+    return jsonify(job)
 
 
 if __name__ == "__main__":
