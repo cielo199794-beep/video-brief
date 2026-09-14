@@ -18,7 +18,7 @@ app = Flask(__name__)
 # ============================================================
 # 配置
 # ============================================================
-DEFAULT_MODEL = "gemini-3-flash-preview"  # 报错就换最新 flash 型号
+DEFAULT_MODEL = "gemini-flash-latest" # 报错就换最新 flash 型号
 
 PRODUCT_CONTEXT = """
 我方产品:
